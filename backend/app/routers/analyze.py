@@ -1,185 +1,128 @@
-"""
-Analysis router - processes resumes against job descriptions
-"""
-from fastapi import APIRouter, HTTPException
-from typing import List
-import uuid
-
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from app.database import get_db
-from app.models import CandidateResponse, AnalysisResponse
-from app.parsing_service import (
-    extract_skills_from_text,
-    extract_experience_level,
-    extract_certifications,
-    generate_anonymized_id
-)
-from app.scoring_service import calculate_scores
-from app.ml_service import ml_service
-import numpy as np
+import pdfplumber
+import io
+import requests
+import re
+import json
+import datetime
+from collections import Counter
+from firebase_admin import firestore
 
 router = APIRouter()
 
-@router.post("/{jd_id}")
-async def analyze_resumes(jd_id: str):
-    """
-    Analyze all resumes for a job description
-    
-    This endpoint:
-    1. Loads the job description and its skills
-    2. Processes each resume
-    3. Calculates scores using ML embeddings
-    4. Returns ranked candidates
-    """
-    # Get job description
-    with get_db() as conn:
-        cursor = conn.cursor()
-        
-        # Get JD
-        cursor.execute("SELECT * FROM job_descriptions WHERE id = ?", (jd_id,))
-        jd_row = cursor.fetchone()
-        
-        if not jd_row:
-            raise HTTPException(status_code=404, detail="Job description not found")
-        
-        # Get JD skills
-        cursor.execute("""
-            SELECT skill_name, weight
-            FROM jd_skills
-            WHERE jd_id = ?
-        """, (jd_id,))
-        skill_rows = cursor.fetchall()
-        
-        if not skill_rows:
-            raise HTTPException(status_code=400, detail="Job description has no skills")
-        
-        # Prepare JD skills with embeddings
-        jd_skills = []
-        skill_names = [row['skill_name'] for row in skill_rows]
-        embeddings = ml_service.generate_embeddings(skill_names)
-        
-        for i, row in enumerate(skill_rows):
-            jd_skills.append({
-                'name': row['skill_name'],
-                'weight': row['weight'],
-                'embedding': embeddings[i]
-            })
-        
-        # Get all resumes for this JD
-        cursor.execute("""
-            SELECT id, file_name, raw_text
-            FROM resumes
-            WHERE jd_id = ?
-        """, (jd_id,))
-        resume_rows = cursor.fetchall()
-        
-        if not resume_rows:
-            raise HTTPException(status_code=404, detail="No resumes found for this job description")
-    
-    # Process each resume
-    candidates_data = []
-    
-    for index, resume_row in enumerate(resume_rows):
-        resume_id = resume_row['id']
-        raw_text = resume_row['raw_text'] or ""
-        
-        # Extract information from resume
-        resume_skills = extract_skills_from_text(raw_text)
-        experience_score = extract_experience_level(raw_text)
-        certifications = extract_certifications(raw_text)
-        certification_count = len(certifications)
-        
-        # Calculate scores
-        scores = calculate_scores(
-            jd_skills=jd_skills,
-            resume_skills=resume_skills,
-            experience_score=experience_score,
-            certification_count=certification_count,
-            experience_weight=jd_row['experience_weight'],
-            certification_weight=jd_row['certification_weight']
-        )
-        
-        # Generate candidate ID
-        candidate_id = str(uuid.uuid4())
-        anonymized_id = generate_anonymized_id(index)
-        
-        # Save candidate to database
-        with get_db() as conn:
-            cursor = conn.cursor()
-            
-            # Insert candidate
-            cursor.execute("""
-                INSERT INTO candidates (
-                    id, jd_id, resume_id, anonymized_id,
-                    overall_score, skill_score, experience_score, certification_score, status
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                candidate_id,
-                jd_id,
-                resume_id,
-                anonymized_id,
-                scores['overall_score'],
-                scores['skill_score'],
-                scores['experience_score'],
-                scores['certification_score'],
-                scores['status']
-            ))
-            
-            # Insert candidate skills
-            for skill_match in scores['skill_matches']:
-                cursor.execute("""
-                    INSERT INTO candidate_skills (
-                        candidate_id, skill_name, similarity, matched, matched_with
-                    )
-                    VALUES (?, ?, ?, ?, ?)
-                """, (
-                    candidate_id,
-                    skill_match['name'],
-                    skill_match['similarity'],
-                    skill_match['matched'],
-                    skill_match.get('matched_with')
-                ))
-            
-            # Insert missing skills
-            for missing_skill in scores['missing_skills']:
-                cursor.execute("""
-                    INSERT INTO missing_skills (candidate_id, skill_name)
-                    VALUES (?, ?)
-                """, (candidate_id, missing_skill))
-            
-            # Insert explanations
-            for explanation in scores['explanations']:
-                cursor.execute("""
-                    INSERT INTO explanations (candidate_id, explanation_text)
-                    VALUES (?, ?)
-                """, (candidate_id, explanation))
-            
-            conn.commit()
-        
-        # Prepare response
-        candidates_data.append({
-            'id': candidate_id,
-            'anonymized_id': anonymized_id,
-            'file_name': resume_row['file_name'],
-            'skills': scores['skill_matches'],
-            'overall_score': scores['overall_score'],
-            'skill_score': scores['skill_score'],
-            'experience_score': scores['experience_score'],
-            'certification_score': scores['certification_score'],
-            'status': scores['status'],
-            'missing_skills': scores['missing_skills'],
-            'explanations': scores['explanations']
-        })
-    
-    # Sort by overall score (descending)
-    candidates_data.sort(key=lambda x: x['overall_score'], reverse=True)
-    
-    return AnalysisResponse(
-        jd_id=jd_id,
-        candidates=[
-            CandidateResponse(**candidate)
-            for candidate in candidates_data
-        ],
-        total_processed=len(candidates_data)
-    )
+# --- CONFIGURATION ---
+HF_TOKEN = "PASTE_YOUR_HUGGING_FACE_TOKEN_HERE" 
+API_URL = "https://api-inference.huggingface.co/models/microsoft/Phi-3.5-mini-instruct"
 
+# --- HELPER FUNCTIONS ---
+def extract_text_and_name(file_bytes):
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            text = ""
+            for page in pdf.pages[:2]: text += page.extract_text() or ""
+            
+            # Smart Name Extraction
+            lines = [l.strip() for l in text.split('\n') if len(l.strip()) > 3]
+            clean = [l for l in lines if "resume" not in l.lower() and "contact" not in l.lower()]
+            name = clean[0] if clean else "Candidate"
+            if "|" in name: name = name.split("|")[0].strip()
+            return text, name
+    except:
+        return "", "Candidate"
+
+def vector_analysis(text, jd, name):
+    """Fallback Math Engine (TF-IDF Style)"""
+    def tokenize(str_input):
+        words = re.findall(r'\b[a-zA-Z+#]{2,}\b', str_input.lower())
+        stop_words = {'and', 'the', 'for', 'with', 'you', 'are', 'this', 'that', 'from', 'have', 'will', 'skills', 'experience', 'description', 'work', 'team'}
+        return [w for w in words if w not in stop_words]
+
+    jd_tokens = tokenize(jd)
+    resume_tokens = tokenize(text)
+    jd_counts = Counter(jd_tokens)
+    resume_counts = Counter(resume_tokens)
+    
+    matches = 0
+    total_weight = 0
+    missing_words = []
+    
+    for word, importance in jd_counts.items():
+        if importance > 0: 
+            total_weight += importance
+            if word in resume_counts:
+                matches += importance
+            else:
+                missing_words.append((word, importance))
+    
+    raw_score = (matches / total_weight) * 100 if total_weight > 0 else 0
+    final_score = min(int(raw_score * 1.5), 98)
+    
+    missing_words.sort(key=lambda x: x[1], reverse=True)
+    top_missing = [w[0].title() for w in missing_words[:3]]
+    
+    if final_score >= 70:
+        summary = f"Strong Match. Covers {int(raw_score)}% of weighted JD terms."
+        feedback = f"Selected. High overlap with JD. Minor gaps: {', '.join(top_missing)}." if top_missing else "Selected. Excellent match."
+    else:
+        summary = f"Weak Match. Resume misses high-frequency JD terms."
+        feedback = f"Not selected. Missing keywords: {', '.join(top_missing)}."
+
+    return {
+        "name": name,
+        "score": final_score,
+        "summary": summary,
+        "feedback": feedback,
+        "status": "Shortlisted" if final_score >= 70 else "Rejected",
+        "analyzed_at": datetime.datetime.now()
+    }
+
+def query_cloud_ai(text, jd):
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    prompt = f"<|user|>JD: {jd[:600]}\nRESUME: {text[:1000]}\nCompare and Output JSON: {{'name': 'Name', 'score': 0, 'summary': 'Summary', 'feedback': 'Feedback'}}<|end|><|assistant|>"
+    try:
+        response = requests.post(API_URL, headers=headers, json={"inputs": prompt}, timeout=15)
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list) and 'generated_text' in result[0]:
+                match = re.search(r'\{.*\}', result[0]['generated_text'], re.DOTALL)
+                if match: return json.loads(match.group())
+    except: return None
+    return None
+
+def save_to_firebase(data, jd_text):
+    db = get_db() # Get the connection from Step 1
+    if db:
+        try:
+            data['job_preview'] = jd_text[:50] + "..."
+            db.collection('resumes').add(data)
+            print(f"🔥 Saved {data['name']} to Firebase")
+        except Exception as e:
+            print(f"⚠️ Firebase Save Error: {e}")
+
+# --- THE MAIN ENDPOINT ---
+@router.post("/")
+async def analyze_resumes(job_description: str = Form(...), files: list[UploadFile] = File(...)):
+    results = []
+    print(f"--- Processing {len(files)} files ---")
+    
+    for file in files:
+        content = await file.read()
+        text, name = extract_text_and_name(content)
+        
+        # 1. AI Analysis
+        analysis = query_cloud_ai(text, job_description)
+        
+        # 2. Vector Fallback
+        if not analysis:
+            analysis = vector_analysis(text, job_description, name)
+        
+        if not analysis.get("name") or analysis.get("name") in ["Candidate", "Name"]:
+            analysis["name"] = name if len(name) < 30 else file.filename
+            
+        # 3. Save to Firebase
+        save_to_firebase(analysis, job_description)
+        
+        results.append(analysis)
+
+    return sorted(results, key=lambda x: x.get('score', 0), reverse=True)
